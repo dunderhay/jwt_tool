@@ -17,6 +17,8 @@ import hmac
 import base64
 import json
 import random
+import tempfile
+from urllib.parse import urljoin, urlparse
 import argparse
 from datetime import datetime
 import configparser
@@ -51,9 +53,15 @@ except:
 # import colorama
 # colorama.init()
 
+jwt_regex=r'ey[A-Za-z0-9_\/+-]*\.ey[A-Za-z0-9_\/+-]*\.[A-Za-z0-9._\/+-]*'
+
 def cprintc(textval, colval):
     if not args.bare:
         cprint(textval, colval)
+
+def b64pad(buf):
+    """ Restore stripped B64 padding """
+    return buf + '=' * (4 - len(buf) % 4 if len(buf) % 4 in (2, 3) else 0)
 
 def createConfig():
     privKeyName = path+"/jwttool_custom_private_RSA.pem"
@@ -127,6 +135,7 @@ def createConfig():
         'scanMode': '',
         'reqMode': '',
         'postData': '',
+        'getData': '',
         'resCode': '',
         'resSize': '',
         'resContent': ''}
@@ -136,15 +145,18 @@ def createConfig():
     cprintc("Make sure to set the \"httplistener\" value to a URL you can monitor to enable out-of-band checks.", "cyan")
     exit(1)
 
-def sendToken(token, cookiedict, track, headertoken="", postdata=None):
+def sendToken(token, cookiedict, track, headertoken="", postdata=None, getdata=None):
     if not postdata:
         postdata = config['argvals']['postData']
+    if not getdata:
+        getdata = config['argvals']['getData']
     url = config['argvals']['targetUrl']
     headers = {'User-agent': config['customising']['useragent']+" "+track}
     if headertoken:
         for eachHeader in headertoken:
-            headerName, headerVal = eachHeader.split(":",1)
-            headers[headerName] = headerVal.lstrip(" ")
+            if eachHeader.replace(' ','') != "":
+                headerName, headerVal = eachHeader.split(":",1)
+                headers[headerName] = headerVal.lstrip(" ")
     try:
         if config['services']['redir'] == "True":
             redirBool = True
@@ -153,12 +165,16 @@ def sendToken(token, cookiedict, track, headertoken="", postdata=None):
         if config['services']['proxy'] == "False":
             if postdata:
                 response = requests.post(url, data=postdata, headers=headers, cookies=cookiedict, proxies=False, verify=False, allow_redirects=redirBool)
+            elif getdata:
+                response = requests.get(url + getdata, headers=headers, cookies=cookiedict, proxies=False, verify=False, allow_redirects=redirBool)
             else:
                 response = requests.get(url, headers=headers, cookies=cookiedict, proxies=False, verify=False, allow_redirects=redirBool)
         else:
             proxies = {'http': 'http://'+config['services']['proxy'], 'https': 'http://'+config['services']['proxy']}
             if postdata:
                 response = requests.post(url, data=postdata, headers=headers, cookies=cookiedict, proxies=proxies, verify=False, allow_redirects=redirBool)
+            elif getdata:
+                response = requests.get(url + getdata, headers=headers, cookies=cookiedict, proxies=proxies, verify=False, allow_redirects=redirBool)
             else:
                 response = requests.get(url, headers=headers, cookies=cookiedict, proxies=proxies, verify=False, allow_redirects=redirBool)
         if int(response.elapsed.total_seconds()) >= 9:
@@ -184,7 +200,7 @@ def parse_dict_cookies(value):
 def strip_dict_cookies(value):
     cookiestring = ""
     for item in value.split(';'):
-        if re.search('eyJ[A-Za-z0-9_\/+-]*\.eyJ[A-Za-z0-9_\/+-]*\.[A-Za-z0-9._\/+-]*', item):
+        if re.search(jwt_regex, item):
             continue
         else:
             cookiestring += "; "+item
@@ -197,7 +213,7 @@ def jwtOut(token, fromMod, desc=""):
     logID = "jwttool_"+hashlib.md5(idFrag.encode()).hexdigest()
     if config['argvals']['targetUrl'] != "":
         curTargetUrl = config['argvals']['targetUrl']
-        p = re.compile('eyJ[A-Za-z0-9_\/+-]*\.eyJ[A-Za-z0-9_\/+-]*\.[A-Za-z0-9._\/+-]*')
+        p = re.compile(jwt_regex)
 
         if config['argvals']['headerloc'] == "cookies":
             cookietoken = p.subn(token, config['argvals']['cookies'], 0)
@@ -225,6 +241,10 @@ def jwtOut(token, fromMod, desc=""):
         else:
             posttoken = [config['argvals']['postdata'],0]
 
+        if config['argvals']['headerloc'] == "getdata":
+            gettoken = p.subn(token, config['argvals']['getdata'], 0)
+        else:
+            gettoken = [config['argvals']['getdata'],0]
 
         try:
             cookiedict = parse_dict_cookies(cookietoken[0])
@@ -234,11 +254,11 @@ def jwtOut(token, fromMod, desc=""):
 
 
         # Check if token was included in substitution
-        if cookietoken[1] == 1 or headertoken[1] == 1 or posttoken[1]:
-            resData = sendToken(token, cookiedict, logID, headertoken[0], posttoken[0])
+        if cookietoken[1] == 1 or headertoken[1] == 1 or posttoken[1] or gettoken:
+            resData = sendToken(token, cookiedict, logID, headertoken[0], posttoken[0], gettoken[0])
         else:
             if config['argvals']['overridesub'] == "true":
-                resData = sendToken(token, cookiedict, logID, headertoken[0], posttoken[0])
+                resData = sendToken(token, cookiedict, logID, headertoken[0], posttoken[0], gettoken[0])
             else:
                 cprintc("[-] No substitution occurred - check that a token is included in a cookie/header in the request", "red")
                 # cprintc(headertoken, cookietoken, "cyan")
@@ -303,7 +323,7 @@ def checkAlgNone(headDict, paylB64):
 
 def checkPubKeyExploit(headDict, paylB64, pubKey):
     try:
-        key = open(pubKey).read()
+        key = RSA.importKey(open(pubKey).read()).exportKey().decode() + "\n"
         cprintc("File loaded: "+pubKey, "cyan")
     except:
         cprintc("[-] File not found", "red")
@@ -589,12 +609,16 @@ def crackSig(sig, contents):
         cprintc(utf8errors, " UTF-8 incompatible passwords skipped", "cyan")
 
 def castInput(newInput):
-    if "{" in str(newInput):
+    if "{" or "[" in str(newInput):
         try:
             jsonInput = json.loads(newInput)
             return jsonInput
         except ValueError:
-            pass
+            try:
+                jsonInput = json.loads(newInput.replace("'", "\""))
+                return jsonInput
+            except ValueError:
+                pass
     if "\"" in str(newInput):
         return newInput.strip("\"")
     elif newInput == "True" or newInput == "true":
@@ -745,6 +769,7 @@ def jwksGen(headDict, paylDict, jku, privKey, kid="jwt_tool"):
     newjwks = buildJWKS(n, e, kid)
     newHead["jku"] = jku
     newHead["alg"] = "RS256"
+    newHead["kid"] = config["customising"]["jwks_kid"]
     key = RSA.importKey(privKey)
     newContents = genContents(newHead, paylDict)
     newContents = newContents.encode('UTF-8')
@@ -777,6 +802,7 @@ def jwksEmbed(newheadDict, newpaylDict):
     newjwks = buildJWKS(n, e, config['customising']['jwks_kid'])
     newHead["jwk"] = newjwks
     newHead["alg"] = "RS256"
+    newHead["kid"] = newjwks["kid"]
     key = privKey
     # key = RSA.importKey(privKey)
     newContents = genContents(newHead, newpaylDict)
@@ -866,34 +892,13 @@ def verifyTokenRSA(headDict, paylDict, sig, pubKey):
     key = RSA.importKey(open(pubKey).read())
     newContents = genContents(headDict, paylDict)
     newContents = newContents.encode('UTF-8')
-    if "-" in sig:
+    try:
+        sig = base64.urlsafe_b64decode(b64pad(sig))
+    except ValueError:
         try:
-            sig = base64.urlsafe_b64decode(sig)
-        except:
-            pass
-        try:
-            sig = base64.urlsafe_b64decode(sig+"=")
-        except:
-            pass
-        try:
-            sig = base64.urlsafe_b64decode(sig+"==")
-        except:
-            pass
-    elif "+" in sig:
-        try:
-            sig = base64.b64decode(sig)
-        except:
-            pass
-        try:
-            sig = base64.b64decode(sig+"=")
-        except:
-            pass
-        try:
-            sig = base64.b64decode(sig+"==")
-        except:
-            pass
-    else:
-        cprintc("Signature not Base64 encoded HEX", "red")
+            sig = base64.b64decode(b64pad(sig))
+        except ValueError:
+            cprintc("Signature not Base64 encoded HEX", "red")
     if headDict['alg'] == "RS256":
         h = SHA256.new(newContents)
     elif headDict['alg'] == "RS384":
@@ -918,50 +923,33 @@ def verifyTokenRSA(headDict, paylDict, sig, pubKey):
 def verifyTokenEC(headDict, paylDict, sig, pubKey):
     newContents = genContents(headDict, paylDict)
     message = newContents.encode('UTF-8')
-    if "-" in str(sig):
+    try:
+        sig = base64.urlsafe_b64decode(b64pad(sig))
+    except ValueError:
         try:
-            signature = base64.urlsafe_b64decode(sig)
-        except:
-            pass
-        try:
-            signature = base64.urlsafe_b64decode(sig+"=")
-        except:
-            pass
-        try:
-            signature = base64.urlsafe_b64decode(sig+"==")
-        except:
-            pass
-    elif "+" in str(sig):
-        try:
-            signature = base64.b64decode(sig)
-        except:
-            pass
-        try:
-            signature = base64.b64decode(sig+"=")
-        except:
-            pass
-        try:
-            signature = base64.b64decode(sig+"==")
-        except:
-            pass
+            sig = base64.b64decode(b64pad(sig))
+        except ValueError:
+            cprintc("Signature not Base64 encoded HEX", "red")
     else:
         cprintc("Signature not Base64 encoded HEX", "red")
     if headDict['alg'] == "ES256":
-        h = SHA256.new(message)
+        h, curvename = SHA256.new(message), 'P-256'
     elif headDict['alg'] == "ES384":
-        h = SHA384.new(message)
+        h, curvename = SHA384.new(message), 'P-384'
     elif headDict['alg'] == "ES512":
-        h = SHA512.new(message)
+        h, curvename = SHA512.new(message), 'P-521'
     else:
         cprintc("Invalid ECDSA algorithm", "red")
     pubkey = open(pubKey, "r")
     pub_key = ECC.import_key(pubkey.read())
+    cprintc("[ ] loaded ECC pubkey on the curve {}".format(pub_key.curve), "cyan")
+    assert pub_key.curve == 'NIST ' + curvename, "Key on unexpected curve loaded"
     verifier = DSS.new(pub_key, 'fips-186-3')
     try:
-        verifier.verify(h, signature)
+        verifier.verify(h, sig)
         cprintc("ECC Signature is VALID", "green")
         valid = True
-    except:
+    except ValueError:
         cprintc("ECC Signature is INVALID", "red")
         valid = False
     return valid
@@ -970,32 +958,13 @@ def verifyTokenPSS(headDict, paylDict, sig, pubKey):
     key = RSA.importKey(open(pubKey).read())
     newContents = genContents(headDict, paylDict)
     newContents = newContents.encode('UTF-8')
-    if "-" in sig:
+    try:
+        sig = base64.urlsafe_b64decode(b64pad(sig))
+    except ValueError:
         try:
-            sig = base64.urlsafe_b64decode(sig)
-        except:
-            pass
-        try:
-            sig = base64.urlsafe_b64decode(sig+"=")
-        except:
-            pass
-        try:
-            sig = base64.urlsafe_b64decode(sig+"==")
-        except:
-            pass
-    elif "+" in sig:
-        try:
-            sig = base64.b64decode(sig)
-        except:
-            pass
-        try:
-            sig = base64.b64decode(sig+"=")
-        except:
-            pass
-        try:
-            sig = base64.b64decode(sig+"==")
-        except:
-            pass
+            sig = base64.b64decode(b64pad(sig))
+        except ValueError:
+            cprintc("Signature not Base64 encoded HEX", "red")
     else:
         cprintc("Signature not Base64 encoded HEX", "red")
     if headDict['alg'] == "PS256":
@@ -1026,61 +995,42 @@ def exportJWKS(jku):
     return newContents, newSig
 
 def parseJWKS(jwksfile):
-    jwks = open(jwksfile, "r").read()
-    jwksDict = json.loads(jwks, object_pairs_hook=OrderedDict)
+    jwksDict = json.load(open(jwksfile, 'r'), object_pairs_hook=OrderedDict)
     nowtime = int(datetime.now().timestamp())
     cprintc("JWKS Contents:", "cyan")
     try:
         keyLen = len(jwksDict["keys"])
         cprintc("Number of keys: "+str(keyLen), "cyan")
-        i = -1
-        for jkey in range(0,keyLen):
-            i += 1
+        kids_seen = set()
+        new_kid = lambda: 1 + max([x for x in kids_seen if isinstance(x, int)], default=0)
+        any1valid = False
+        for d in jwksDict["keys"]:
             cprintc("\n--------", "white")
-            try:
-                cprintc("Key "+str(i+1), "cyan")
-                kid = str(jwksDict["keys"][i]["kid"])
-                cprintc("kid: "+kid, "cyan")
-            except:
-                kid = i
-                cprintc("Key "+str(i+1), "cyan")
-            for keyVal in jwksDict["keys"][i].items():
-                keyVal = keyVal[0]
-                cprintc("[+] "+keyVal+" = "+str(jwksDict["keys"][i][keyVal]), "green")
-            try:
-                x = str(jwksDict["keys"][i]["x"])
-                y = str(jwksDict["keys"][i]["y"])
-                cprintc("\nFound ECC key factors, generating a public key", "cyan")
-                pubkeyName = genECPubFromJWKS(x, y, kid, nowtime)
-                cprintc("[+] "+pubkeyName, "green")
-                cprintc("\nAttempting to verify token using "+pubkeyName, "cyan")
-                valid = verifyTokenEC(headDict, paylDict, sig, pubkeyName)
-            except:
-                pass
-            try:
-                n = str(jwksDict["keys"][i]["n"])
-                e = str(jwksDict["keys"][i]["e"])
-                cprintc("\nFound RSA key factors, generating a public key", "cyan")
-                pubkeyName = genRSAPubFromJWKS(n, e, kid, nowtime)
-                cprintc("[+] "+pubkeyName, "green")
-                cprintc("\nAttempting to verify token using "+pubkeyName, "cyan")
-                valid = verifyTokenRSA(headDict, paylDict, sig, pubkeyName)
-            except:
-                pass
-    except:
+            kid = d['kid'] if 'kid' in d else new_kid()
+            kids_seen.add(kid)
+            cprintc(f"Key kid {kid}", "cyan")
+            for k, v in d.items():
+                cprintc(f"[+] {k} = {v}", "green")
+            if parseSingleJWK(d, nowtime, kid=kid):
+                any1valid = True
+        return any1valid
+    except ValueError:
         cprintc("Single key file", "white")
         for jkey in jwksDict:
             cprintc("[+] "+jkey+" = "+str(jwksDict[jkey]), "green")
+        return parseSingleJWK(jwksDict, nowtime)
+
+def parseSingleJWK(jwksDict, nowtime, kid=1):
         try:
             kid = 1
             x = str(jwksDict["x"])
             y = str(jwksDict["y"])
             cprintc("\nFound ECC key factors, generating a public key", "cyan")
-            pubkeyName = genECPubFromJWKS(x, y, kid, nowtime)
+            pubkeyName = genECPubFromJWKS(x, y, kid, nowtime, curve=jwksDict.get('crv'))
             cprintc("[+] "+pubkeyName, "green")
             cprintc("\nAttempting to verify token using "+pubkeyName, "cyan")
-            valid = verifyTokenEC(headDict, paylDict, sig, pubkeyName)
-        except:
+            return verifyTokenEC(headDict, paylDict, sig, pubkeyName)
+        except KeyError:
             pass
         try:
             kid = 1
@@ -1090,36 +1040,14 @@ def parseJWKS(jwksfile):
             pubkeyName = genRSAPubFromJWKS(n, e, kid, nowtime)
             cprintc("[+] "+pubkeyName, "green")
             cprintc("\nAttempting to verify token using "+pubkeyName, "cyan")
-            valid = verifyTokenRSA(headDict, paylDict, sig, pubkeyName)
+            return verifyTokenRSA(headDict, paylDict, sig, pubkeyName)
         except:
             pass
 
-def genECPubFromJWKS(x, y, kid, nowtime):
-    try:
-        x = int.from_bytes(base64.urlsafe_b64decode(x), byteorder='big')
-    except:
-        pass
-    try:
-        x = int.from_bytes(base64.urlsafe_b64decode(x+"="), byteorder='big')
-    except:
-        pass
-    try:
-        x = int.from_bytes(base64.urlsafe_b64decode(x+"=="), byteorder='big')
-    except:
-        pass
-    try:
-        y = int.from_bytes(base64.urlsafe_b64decode(y), byteorder='big')
-    except:
-        pass
-    try:
-        y = int.from_bytes(base64.urlsafe_b64decode(y+"="), byteorder='big')
-    except:
-        pass
-    try:
-        y = int.from_bytes(base64.urlsafe_b64decode(y+"=="), byteorder='big')
-    except:
-        pass
-    new_key = ECC.construct(curve='P-256', point_x=x, point_y=y)
+def genECPubFromJWKS(x, y, kid, nowtime, curve=None):
+    x = int.from_bytes(base64.urlsafe_b64decode(b64pad(x)), byteorder='big')
+    y = int.from_bytes(base64.urlsafe_b64decode(b64pad(y)), byteorder='big')
+    new_key = ECC.construct(curve=curve or 'P-256', point_x=x, point_y=y)
     pubKey = new_key.public_key().export_key(format="PEM")+"\n"
     pubkeyName = "kid_"+str(kid)+"_"+str(nowtime)+".pem"
     with open(pubkeyName, 'w') as test_pub_out:
@@ -1127,30 +1055,8 @@ def genECPubFromJWKS(x, y, kid, nowtime):
     return pubkeyName
 
 def genRSAPubFromJWKS(n, e, kid, nowtime):
-    try:
-        n = int.from_bytes(base64.urlsafe_b64decode(n), byteorder='big')
-    except:
-        pass
-    try:
-        n = int.from_bytes(base64.urlsafe_b64decode(n+"="), byteorder='big')
-    except:
-        pass
-    try:
-        n = int.from_bytes(base64.urlsafe_b64decode(n+"=="), byteorder='big')
-    except:
-        pass
-    try:
-        e = int.from_bytes(base64.urlsafe_b64decode(e), byteorder='big')
-    except:
-        pass
-    try:
-        e = int.from_bytes(base64.urlsafe_b64decode(e+"="), byteorder='big')
-    except:
-        pass
-    try:
-        e = int.from_bytes(base64.urlsafe_b64decode(e+"=="), byteorder='big')
-    except:
-        pass
+    n = int.from_bytes(base64.urlsafe_b64decode(b64pad(n)), byteorder='big')
+    e = int.from_bytes(base64.urlsafe_b64decode(b64pad(e)), byteorder='big')
     new_key = RSA.construct((n, e))
     pubKey = new_key.publickey().exportKey(format="PEM")
     pubkeyName = "kid_"+str(kid)+"_"+str(nowtime)+".pem"
@@ -1329,6 +1235,8 @@ def rejigToken(headDict, paylDict, sig):
             claimnum += 1
     if expiredtoken:
         cprintc("[-] TOKEN IS EXPIRED!", "red")
+    if 'exp' not in comparestamps:
+        cprintc("[-] Token does not have an expiry set.", "red")
     cprintc("\n----------------------\nJWT common timestamps:\niat = IssuedAt\nexp = Expires\nnbf = NotBefore\n----------------------\n", "white")
     if args.targeturl and not args.crack and not args.exploit and not args.verify and not args.tamper and not args.sign:
         cprintc("[+] Sending token", "cyan")
@@ -1350,7 +1258,7 @@ def searchLog(logID):
             qOutput = re.sub(' - eyJ[A-Za-z0-9_\/+-]*\.eyJ[A-Za-z0-9_\/+-]*\.[A-Za-z0-9._\/+-]*', '', qResult)
             qOutput = re.sub(logID+' - ', '', qOutput)
             try:
-                jwt = re.findall('eyJ[A-Za-z0-9_\/+-]*\.eyJ[A-Za-z0-9_\/+-]*\.[A-Za-z0-9._\/+-]*', qResult)[-1]
+                jwt = re.findall(jwt_regex, qResult)[-1]
             except:
                 cprintc("JWT not included in log", "red")
                 exit(1)
@@ -1375,6 +1283,10 @@ def injectOut(newheadDict, newpaylDict):
 def scanModePlaybook():
     cprintc("\nLAUNCHING SCAN: JWT Attack Playbook", "magenta")
     origalg = headDict["alg"]
+    try:
+        origkid = headDict["kid"]
+    except:
+        origkid = False
     # No token
     tmpCookies = config['argvals']['cookies']
     tmpHeader = config['argvals']['header']
@@ -1424,6 +1336,10 @@ def scanModePlaybook():
     jwksig, jwksContents = jwksEmbed(headDict, paylDict)
     jwtOut(jwksContents+"."+jwksig, "Exploit: Injected JWKS (-X i)")
     headDict["alg"] = origalg
+    if origkid:
+        headDict["kid"] = origkid
+    else:
+        del headDict["kid"]
     if origjwk:
         headDict["jwk"] = origjwk
     else:
@@ -1439,6 +1355,10 @@ def scanModePlaybook():
             jku = config['services']['jwksdynamic']
     newContents, newSig = exportJWKS(jku)
     jwtOut(newContents+"."+newSig, "Exploit: Spoof JWKS (-X s)", "Signed with JWKS at "+jku)
+    if origkid:
+        headDict["kid"] = origkid
+    else:
+        del headDict["kid"]
     if origjku:
         headDict["jku"] = origjku
     else:
@@ -1511,11 +1431,11 @@ def scanModePlaybook():
     cprintc("Scanning mode completed: review the above results.\n", "magenta")
     # Further manual testing: check expired token, brute key, find Public Key, run other scans
     cprintc("The following additional checks should be performed that are better tested manually:", "magenta")
-    if headDict['alg'][:2] == "HS" or headDict['alg'][:2] == "hs":
-        cprintc("[+] Try testing "+headDict['alg'][:2]+" token against weak password configurations by running the following hashcat cracking options:", "green")
+    if origalg[:2] == "HS" or origalg[:2] == "hs":
+        cprintc("[+] Try testing "+origalg[:2]+" token against weak password configurations by running the following hashcat cracking options:", "green")
         cprintc("(Already testing against passwords in jwt-common.txt)", "cyan")
         cprintc("Try using longer dictionaries, custom dictionaries, mangling rules, or brute force attacks.\nhashcat (https://hashcat.net/hashcat/) is ideal for this as it is highly optimised for speed. Just add your JWT to a text file, then use the following syntax to give you a good start:\n\n[*] dictionary attacks: hashcat -a 0 -m 16500 jwt.txt passlist.txt\n[*] rule-based attack:  hashcat -a 0 -m 16500 jwt.txt passlist.txt -r rules/best64.rule\n[*] brute-force attack: hashcat -a 3 -m 16500 jwt.txt ?u?l?l?l?l?l?l?l -i --increment-min=6", "cyan")
-    if headDict['alg'][:2] != "HS" and headDict['alg'][:2] != "hs":
+    if origalg[:2] != "HS" and origalg[:2] != "hs":
         cprintc("[+] Try hunting for a Public Key for this token. Validate any JWKS you find (-V -jw [jwks_file]) and then use the generated Public Key file with the Playbook Scan (-pk [kid_from_jwks].pem)", "green")
         cprintc("Common locations for Public Keys are either the web application's SSL key, or stored as a JWKS file in one of these locations:", "cyan")
         with open('jwks-common.txt', "r", encoding='utf-8', errors='ignore') as jwksLst:
@@ -1787,6 +1707,16 @@ def runActions():
                 exit(1)
         elif args.jwksfile:
             parseJWKS(config['crypto']['jwks'])
+        elif args.jwksurl:
+            resp = requests.get(args.jwksurl)
+            assert resp.ok
+
+            with tempfile.NamedTemporaryFile() as tmp:
+                tmp.write(resp.content)
+                tmp.flush()
+                tmp.seek(0)
+                valid = parseJWKS(tmp.name)
+                exit(0 if valid else 1)
         else:
             cprintc("No Public Key or JWKS file provided (-pk/-jw)\n", "red")
             parser.print_usage()
@@ -1828,10 +1758,16 @@ if __name__ == '__main__':
                         help="return TOKENS ONLY")
     parser.add_argument("-t", "--targeturl", action="store",
                         help="URL to send HTTP request to with new JWT")
+    parser.add_argument("-r", "--request", action="store",
+                        help="URL request to base on")
+    parser.add_argument("-i", "--insecure", action="store_true",
+                        help="Use HTTP for passed request")
     parser.add_argument("-rc", "--cookies", action="store",
                         help="request cookies to send with the forged HTTP request")
     parser.add_argument("-rh", "--headers", action="append",
                         help="request headers to send with the forged HTTP request (can be used multiple times for additional headers)")
+    parser.add_argument("-gd", "--getdata", action="store",
+                        help="text string that contains all the data to be sent in a GET request")
     parser.add_argument("-pd", "--postdata", action="store",
                         help="text string that contains all the data to be sent in a POST request")
     parser.add_argument("-cv", "--canaryvalue", action="store",
@@ -1847,7 +1783,7 @@ if __name__ == '__main__':
     parser.add_argument("-ju", "--jwksurl", action="store",
                         help="URL location where you can host a spoofed JWKS")
     parser.add_argument("-S", "--sign", action="store",
-                        help="sign the resulting token:\nhs256/hs384/hs512 = HMAC-SHA signing (specify a secret with -k/-p)\nrs256/rs384/hs512 = RSA signing (specify an RSA private key with -pr)\nes256/es384/es512 = Elliptic Curve signing (specify an EC private key with -pr)\nps256/ps384/ps512 = PSS-RSA signing (specify an RSA private key with -pr)")
+                        help="sign the resulting token:\nhs256/hs384/hs512 = HMAC-SHA signing (specify a secret with -k/-p)\nrs256/rs384/rs512 = RSA signing (specify an RSA private key with -pr)\nes256/es384/es512 = Elliptic Curve signing (specify an EC private key with -pr)\nps256/ps384/ps512 = PSS-RSA signing (specify an RSA private key with -pr)")
     parser.add_argument("-pr", "--privkey", action="store",
                         help="Private Key for Asymmetric crypto")
     parser.add_argument("-T", "--tamper", action="store_true",
@@ -1903,33 +1839,91 @@ if __name__ == '__main__':
         os.rename(configFileName, path+"/old_("+config['services']['jwt_tool_version']+")_jwtconf.ini")
         createConfig()
         exit(1)
-    with open(path+"/null.txt", 'w') as nullfile:
-        pass
     findJWT = ""
+
+    if args.request:
+        port = ''
+
+        with open(args.request, 'r') as file:
+            first_line = file.readline().strip()
+            method, first_line_remainder = first_line.split(' ', 1)
+            url = first_line_remainder.split(' ', 1)[0]
+            base_url = ''
+
+            in_headers = True
+            args.postdata = ''
+
+            for line in file:
+
+                line = line.strip()
+                if not line:
+                    # Stop when reaching an empty line (end of headers)
+                    in_headers = False
+                    continue
+
+                if in_headers:
+                    if line.lower().startswith('host:'):
+                        # Extract the host from the 'Host' header
+                        _, host = line.split(':', 1)
+                        host = host.strip()
+
+                        if ':' in host:
+                            host, port = host.split(':', 1)
+
+                        protocol = "http" if args.insecure else "https"
+
+                        base_url = f"{protocol}://{host}"
+
+                    elif line.lower().startswith('cookie:'):
+                        cookie = line.split(': ')[1]
+                        if not args.cookies:
+                            args.cookies = ''
+                        args.cookies += cookie
+                    else:
+                        # Don't add user agent field, otherwise 'jwt_tool' in user agent will not work
+                        if not line.lower().startswith('user-agent:'):
+                            if not args.headers:
+                                args.headers = []
+                            args.headers.append(line)
+                else:
+                    args.postdata += line
+
+            if not port:
+                url_object = urlparse(url)
+                if url_object.port:
+                    port = str(url_object.port)
+
+        absolute_url = urljoin(base_url + (':' + port if port else ''), url)
+        args.targeturl = absolute_url
+
     if args.targeturl:
-        if args.cookies or args.headers or args.postdata:
+        if args.cookies or args.headers or args.postdata or args.getdata:
             jwt_count = 0
             jwt_locations = []
 
-            if args.cookies and re.search('eyJ[A-Za-z0-9_\/+-]*\.eyJ[A-Za-z0-9_\/+-]*\.[A-Za-z0-9._\/+-]*', args.cookies):
+            if args.cookies and re.search(jwt_regex, args.cookies):
                 jwt_count += 1
                 jwt_locations.append("cookie")
 
-            if args.headers and re.search('eyJ[A-Za-z0-9_\/+-]*\.eyJ[A-Za-z0-9_\/+-]*\.[A-Za-z0-9._\/+-]*', str(args.headers)):
+            if args.headers and re.search(jwt_regex, str(args.headers)):
                 jwt_count += 1
                 jwt_locations.append("headers")
 
-            if args.postdata and re.search('eyJ[A-Za-z0-9_\/+-]*\.eyJ[A-Za-z0-9_\/+-]*\.[A-Za-z0-9._\/+-]*', str(args.postdata)):
+            if args.postdata and re.search(jwt_regex, str(args.postdata)):
                 jwt_count += 1
                 jwt_locations.append("post data")
+            
+            if args.getdata and re.search(jwt_regex, str(args.getdata)):
+                jwt_count += 1
+                jwt_locations.append("get data")
 
             if jwt_count > 1:
-                cprintc("Too many tokens! JWT in more than one place: cookie, header, POST data", "red")
+                cprintc("Too many tokens! JWT in more than one place: cookie, header, POST data, or GET data", "red")
                 exit(1)
 
             if args.cookies:
                 try:
-                    if re.search('eyJ[A-Za-z0-9_\/+-]*\.eyJ[A-Za-z0-9_\/+-]*\.[A-Za-z0-9._\/+-]*', args.cookies):
+                    if re.search(jwt_regex, args.cookies):
                         config['argvals']['headerloc'] = "cookies"
                 except:
                     cprintc("Invalid cookie formatting", "red")
@@ -1937,7 +1931,7 @@ if __name__ == '__main__':
 
             if args.headers:
                 try:
-                    if re.search('eyJ[A-Za-z0-9_\/+-]*\.eyJ[A-Za-z0-9_\/+-]*\.[A-Za-z0-9._\/+-]*', str(args.headers)):
+                    if re.search(jwt_regex, str(args.headers)):
                         config['argvals']['headerloc'] = "headers"
                 except:
                     cprintc("Invalid header formatting", "red")
@@ -1945,20 +1939,29 @@ if __name__ == '__main__':
 
             if args.postdata:
                 try:
-                    if re.search('eyJ[A-Za-z0-9_\/+-]*\.eyJ[A-Za-z0-9_\/+-]*\.[A-Za-z0-9._\/+-]*', str(args.postdata)):
+                    if re.search(jwt_regex, str(args.postdata)):
                         config['argvals']['headerloc'] = "postdata"
                 except:
                     cprintc("Invalid postdata formatting", "red")
                     exit(1)
 
+            if args.getdata:
+                try:
+                    if re.search(jwt_regex, str(args.getdata)):
+                        config['argvals']['headerloc'] = "getdata"
+                except:
+                    cprintc("Invalid getdata formatting", "red")
+                    exit(1)
+
             searchString = " | ".join([
                 str(args.cookies),
                 str(args.headers),
-                str(args.postdata)
+                str(args.postdata),
+                str(args.getdata)
             ])
 
             try:
-                findJWT = re.search('eyJ[A-Za-z0-9_\/+-]*\.eyJ[A-Za-z0-9_\/+-]*\.[A-Za-z0-9._\/+-]*', searchString)[0]
+                findJWT = re.search(jwt_regex, searchString)[0]
             except:
                 cprintc("Cannot find a valid JWT", "red")
                 cprintc(searchString, "cyan")
@@ -2029,12 +2032,16 @@ if __name__ == '__main__':
         config['argvals']['headervalue'] = str(args.headervalue)
     if args.postdata:
         config['argvals']['postData'] = args.postdata
+    if args.getdata:
+        config['argvals']['getData'] = args.getdata
     if args.canaryvalue:
         config['argvals']['canaryvalue'] = args.canaryvalue
     if args.noproxy:
         config['services']['proxy'] = "False"
     if args.noredir:
         config['services']['redir'] = "False"
+    if args.request:
+        config['argvals']['request'] = args.request
 
     if not args.crack and not args.exploit and not args.verify and not args.tamper and not args.injectclaims:
         rejigToken(headDict, paylDict, sig)
